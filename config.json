@@ -1,0 +1,10 @@
+{
+    "sam_path": "",
+    "cycle_duration_min": 20,
+    "control_check_delay_sec": 20,
+    "minutes_per_card": 25,
+    "boost_enabled": true,
+    "boost_threshold_hours": 2.0,
+    "launch_hidden": true,
+    "launch_minimized": false
+}
