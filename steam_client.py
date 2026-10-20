@@ -68,32 +68,43 @@ class MEMORY_BASIC_INFORMATION(ctypes.Structure):
         ("Type", wintypes.DWORD),
     ]
 
-def parse_playtime(text):
+def parse_playtime_minutes(text):
     """
-    Fallback parser for Steam badge playtime string (Russian or English).
-    Returns float hours.
+    Parses Steam badge playtime string (Ukrainian, Russian, English) into integer minutes.
+    Handles combinations like '1.5 год.', '45 хв.', '1 год. 30 хв.', '1 ч. 30 мин.', '2 hrs', etc.
     """
     if not text:
-        return 0.0
+        return 0
     text = text.lower().replace(',', '.')
     
-    # Hours match
-    hm = re.search(r'([\d\.]+)\s*(?:ч|hr|hour)', text)
+    hours = 0.0
+    minutes = 0.0
+    
+    # Hours match: '1.5 год', '2 год.', '1.5 ч', '2 ч.', '1 hr', '2.5 hours'
+    hm = re.search(r'([\d\.]+)\s*(?:год|годин|години|ч|час|часов|hr|hrs|hour|hours)', text)
     if hm:
         try:
-            return float(hm.group(1))
+            hours = float(hm.group(1))
         except ValueError:
             pass
             
-    # Minutes match
-    mm = re.search(r'([\d\.]+)\s*(?:мин|min)', text)
+    # Minutes match: '30 хв', '45 хвилин', '30 мин', '45 min', '20 minutes'
+    mm = re.search(r'([\d\.]+)\s*(?:хв|хвилин|хвилини|мин|минут|минуты|min|mins|minute|minutes)', text)
     if mm:
         try:
-            return float(mm.group(1)) / 60.0
+            minutes = float(mm.group(1))
         except ValueError:
             pass
             
-    return 0.0
+    total_mins = int(round(hours * 60.0 + minutes))
+    return max(0, total_mins)
+
+def parse_playtime(text):
+    """
+    Fallback parser for Steam badge playtime string.
+    Returns float hours.
+    """
+    return parse_playtime_minutes(text) / 60.0
 
 class SteamClient:
     def __init__(self, manual_cookie=None):
@@ -309,7 +320,7 @@ class SteamClient:
                 else:
                     playtime_el = row.find('div', class_='badge_title_stats_playtime')
                     raw_playtime = playtime_el.get_text(strip=True) if playtime_el else ""
-                    playtime_minutes = int(parse_playtime(raw_playtime) * 60)
+                    playtime_minutes = parse_playtime_minutes(raw_playtime)
 
                 all_games.append({
                     'appid': appid,
@@ -357,19 +368,115 @@ class SteamClient:
         resp.encoding = 'utf-8'
         soup = BeautifulSoup(resp.text, 'html.parser')
         progress_info = soup.find('span', class_='progress_info_bold')
-        if not progress_info:
-            all_text = soup.get_text().lower()
-            if 'больше нет карточек' in all_text or 'no card drops remaining' in all_text or 'получили все' in all_text:
-                return 0
-            return 0
-
-        text = progress_info.text.strip()
-        match = re.search(r'(\d+)', text)
-        if match and ('карточ' in text.lower() or 'card' in text.lower() or 'выпад' in text.lower()):
-            return int(match.group(1))
-
         all_text = soup.get_text().lower()
-        if 'больше нет карточек' in all_text or 'no card drops remaining' in all_text or 'получили все' in all_text:
+
+        # Check explicit zero-drop indicators first (Russian, Ukrainian, English)
+        zero_drop_phrases = [
+            'больше не выпадут', 'больше не выпадают', 'карточки больше не выпадут',
+            'карточки больше не выпадают', 'больше нет карточек', 'карточки больше не доступны',
+            'карток більше не випаде', 'більше не випаде', 'не випаде',
+            'карток більше не випадатимуть', 'більше не випадатимуть', 'не випадатимуть',
+            'більше немає карток', 'немає карток', 'отримали всі картки',
+            'випали всі картки', '0 карток залишилося', 'ще може випасти карток: 0',
+            'no card drops remaining', 'получили все карточки', 'выпали все карточки',
+            "you don't have any more card drops", '0 карточек осталось', '0 card drops',
+            'выпадений больше нет', 'карточки не выпадают'
+        ]
+        is_zero_drops = any(phrase in all_text for phrase in zero_drop_phrases)
+
+        if progress_info:
+            text = progress_info.text.strip().lower()
+            if any(phrase in text for phrase in [
+                'больше не', 'не выпадут', 'не выпадают',
+                'більше не', 'не випаде', 'не випадатимуть', 'немає карток',
+                'no card', 'no more', '0 '
+            ]):
+                return 0
+            match = re.search(r'(\d+)', text)
+            if match and any(k in text for k in ['карт', 'card', 'выпад', 'випад', 'остал', 'залиш', 'може']):
+                return int(match.group(1))
+
+        if is_zero_drops:
             return 0
 
-        return 0
+        # If neither counter nor completion phrase was found, don't falsely return 0
+        return None
+
+    def check_badges_page_drops(self, appid):
+        """
+        Cross-verifies remaining card drops for appid directly from the Badges page (supports UK, RU, EN).
+        Returns:
+            int: exact number of drops remaining (0 if game has finished and no drops left)
+            None: on network error
+        """
+        if not self.cookies:
+            self.refresh_cookies()
+
+        url = "https://steamcommunity.com/my/badges/?p=1"
+        try:
+            resp = requests.get(url, cookies=self.cookies, headers=self.headers, timeout=12)
+            if resp.status_code != 200:
+                return None
+            resp.encoding = 'utf-8'
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            rows = soup.find_all('div', class_='badge_row')
+
+            # Search row for appid
+            target_row = None
+            for row in rows:
+                link = row.find('a', href=True)
+                if link and f'gamecards/{appid}' in link['href']:
+                    target_row = row
+                    break
+
+            if target_row:
+                progress_el = target_row.find('span', class_='progress_info_bold')
+                if progress_el:
+                    text = progress_el.get_text(strip=True).lower()
+                    if any(phrase in text for phrase in [
+                        'больше не', 'не выпадут', 'не выпадают',
+                        'більше не', 'не випаде', 'не випадатимуть', 'немає карток',
+                        'no card', 'no more'
+                    ]):
+                        return 0
+                    m = re.search(r'(\d+)', text)
+                    if m and any(k in text for k in ['карт', 'card', 'выпад', 'випад', 'остал', 'залиш', 'може']):
+                        return int(m.group(1))
+                return 0
+            else:
+                # If game is not on page 1, check pagination
+                pagelinks = soup.find_all('a', class_='pagelink')
+                if pagelinks:
+                    page = 2
+                    while page <= 5:
+                        p_url = f"https://steamcommunity.com/my/badges/?p={page}"
+                        p_resp = requests.get(p_url, cookies=self.cookies, headers=self.headers, timeout=12)
+                        if p_resp.status_code != 200:
+                            break
+                        p_resp.encoding = 'utf-8'
+                        p_soup = BeautifulSoup(p_resp.text, 'html.parser')
+                        p_rows = p_soup.find_all('div', class_='badge_row')
+                        for row in p_rows:
+                            link = row.find('a', href=True)
+                            if link and f'gamecards/{appid}' in link['href']:
+                                progress_el = row.find('span', class_='progress_info_bold')
+                                if progress_el:
+                                    text = progress_el.get_text(strip=True).lower()
+                                    if any(phrase in text for phrase in [
+                                        'больше не', 'не выпадут', 'не выпадают',
+                                        'більше не', 'не випаде', 'не випадатимуть', 'немає карток',
+                                        'no card', 'no more'
+                                    ]):
+                                        return 0
+                                    m = re.search(r'(\d+)', text)
+                                    if m and any(k in text for k in ['карт', 'card', 'выпад', 'випад', 'остал', 'залиш', 'може']):
+                                        return int(m.group(1))
+                                return 0
+                        has_next = any(p.text.strip() == str(page + 1) for p in p_soup.find_all('a', class_='pagelink'))
+                        if not has_next:
+                            break
+                        page += 1
+                # If appid was not found across any badge page with active drops, it means 0 drops left!
+                return 0
+        except Exception:
+            return None

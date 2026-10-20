@@ -1,0 +1,74 @@
+{
+  "323720": {
+    "title": "Decay - The Mare",
+    "steam_baseline_mins": 201,
+    "target_boost_seconds": 0,
+    "boost_seconds_served": 0.0,
+    "remaining_boost_seconds": 0,
+    "completed": true,
+    "last_updated": "2026-10-20 21:07:13"
+  },
+  "265330": {
+    "title": "Gomo",
+    "steam_baseline_mins": 157,
+    "target_boost_seconds": 0,
+    "boost_seconds_served": 0.0,
+    "remaining_boost_seconds": 0,
+    "completed": true,
+    "last_updated": "2026-10-21 01:24:57"
+  },
+  "255300": {
+    "title": "Journey of a Roach",
+    "steam_baseline_mins": 134,
+    "target_boost_seconds": 0,
+    "boost_seconds_served": 0.0,
+    "remaining_boost_seconds": 0,
+    "completed": true,
+    "last_updated": "2026-10-21 01:24:57"
+  },
+  "879510": {
+    "title": "Lucy Got Problems",
+    "steam_baseline_mins": 133,
+    "target_boost_seconds": 0,
+    "boost_seconds_served": 0.0,
+    "remaining_boost_seconds": 0,
+    "completed": true,
+    "last_updated": "2026-10-21 01:24:57"
+  },
+  "281750": {
+    "title": "Munin",
+    "steam_baseline_mins": 133,
+    "target_boost_seconds": 0,
+    "boost_seconds_served": 0.0,
+    "remaining_boost_seconds": 0,
+    "completed": true,
+    "last_updated": "2026-10-21 01:24:57"
+  },
+  "314810": {
+    "title": "Randal's Monday",
+    "steam_baseline_mins": 134,
+    "target_boost_seconds": 0,
+    "boost_seconds_served": 0.0,
+    "remaining_boost_seconds": 0,
+    "completed": true,
+    "last_updated": "2026-10-21 01:24:57"
+  },
+  "382140": {
+    "title": "SKYHILL",
+    "steam_baseline_mins": 134,
+    "target_boost_seconds": 0,
+    "boost_seconds_served": 0.0,
+    "remaining_boost_seconds": 0,
+    "completed": true,
+    "last_updated": "2026-10-21 01:24:57"
+  },
+  "260160": {
+    "title": "The Last Tinker: City of Colors",
+    "steam_baseline_mins": 134,
+    "target_boost_seconds": 0,
+    "boost_seconds_served": 0.0,
+    "remaining_boost_seconds": 0,
+    "completed": true,
+    "last_updated": "2026-10-21 01:24:57"
+  }
+}

@@ -1,61 +1,93 @@
 @echo off
-title Установка зависимостей Steam Card Farmer
 cd /d "%~dp0"
 
 echo ========================================================
-echo Проверка и установка библиотек: requests, beautifulsoup4, pillow...
+echo   Install Requirements for Steam Card Farmer
 echo ========================================================
-echo.
+echo Searching for Python...
 
-:: 1. Check local pythoncore
-if exist "%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe" (
-    "%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe" -m pip install -r requirements.txt
-    goto finish
-)
+set "RUN_PY="
 
-:: 2. Check standard Windows AppData Python
-for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python3*") do (
-    if exist "%%D\python.exe" (
-        "%%D\python.exe" -m pip install -r requirements.txt
-        goto finish
-    )
-)
-
-:: 3. Check Program Files Python
-for /d %%D in ("C:\Program Files\Python3*") do (
-    if exist "%%D\python.exe" (
-        "%%D\python.exe" -m pip install -r requirements.txt
-        goto finish
-    )
-)
-
-:: 4. Try py launcher
+REM 1. Check Python Launcher (py)
 where py >nul 2>&1
-if %errorlevel% equ 0 (
-    py -m pip install -r requirements.txt
-    goto finish
+if not errorlevel 1 (
+    py -3 -c "import sys" >nul 2>&1
+    if not errorlevel 1 (
+        set RUN_PY=py -3
+        goto do_install
+    )
 )
 
-:: 5. Try PATH python
-where python >nul 2>&1
-if %errorlevel% equ 0 (
-    python -m pip install -r requirements.txt
-    goto finish
+REM 2. Check system PATH
+for /f "delims=" %%I in ('where python 2^>nul') do (
+    if not defined RUN_PY (
+        echo %%I | findstr /i "WindowsApps" >nul
+        if errorlevel 1 (
+            "%%I" -c "import sys" >nul 2>&1
+            if not errorlevel 1 (
+                set RUN_PY="%%I"
+                goto do_install
+            )
+        )
+    )
 )
 
-echo.
-echo [ОШИБКА] Python не найден на этом компьютере!
-echo Скачайте и установите Python с https://python.org
-echo При установке ОБЯЗАТЕЛЬНО поставьте галочку "Add python.exe to PATH"!
-echo.
+REM 3. Check AppData Programs
+for %%V in (314 313 312 311 310 39 38) do (
+    if not defined RUN_PY (
+        if exist "%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe" (
+            set RUN_PY="%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe"
+            goto do_install
+        )
+    )
+)
+
+REM 4. Check Program Files
+for %%V in (314 313 312 311 310 39 38) do (
+    if not defined RUN_PY (
+        if exist "%ProgramFiles%\Python%%V\python.exe" (
+            set RUN_PY="%ProgramFiles%\Python%%V\python.exe"
+            goto do_install
+        )
+    )
+)
+
+REM 5. Check pythoncore
+for /d %%C in ("%LOCALAPPDATA%\Python\pythoncore-*") do (
+    if not defined RUN_PY (
+        if exist "%%C\python.exe" (
+            set RUN_PY="%%C\python.exe"
+            goto do_install
+        )
+    )
+)
+
+echo [ERROR] Python was not found on this computer!
+echo Please install Python 3.8+ from https://www.python.org/downloads/
+echo Make sure to check 'Add python.exe to PATH' during installation.
 pause
 exit /b 1
 
-:finish
+:do_install
+echo Using Python: %RUN_PY%
 echo.
-echo ========================================================
-echo Все зависимости успешно установлены!
-echo Теперь вы можете запускать бота через Start_Farmer.bat
-echo ========================================================
+echo Installing requests, beautifulsoup4, pillow...
+%RUN_PY% -m pip install -r requirements.txt
+if errorlevel 1 (
+    echo Retrying with --user flag...
+    %RUN_PY% -m pip install --user -r requirements.txt
+)
+
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Failed to install libraries. Please check your internet connection.
+) else (
+    echo.
+    echo ========================================================
+    echo [SUCCESS] All requirements installed successfully!
+    echo You can now launch Start_Farmer.bat
+    echo ========================================================
+)
 echo.
 pause
+exit /b 0

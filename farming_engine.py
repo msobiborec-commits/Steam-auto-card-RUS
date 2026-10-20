@@ -143,6 +143,7 @@ def cleanup_all_sam_processes():
     kill_processes_by_name("SAM.Game")
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+BOOST_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "boost_state.json")
 
 def find_sam_executable():
     """Tries to find SAM.Game.exe automatically on the system."""
@@ -193,15 +194,15 @@ class GameItem:
         self.initial_drops = int(drops_left)
         self.current_drops = int(drops_left)
         self.session_dropped = 0
-        self.initial_playtime_mins = int(playtime_minutes)
-        self.boost_seconds = 0
-        self.farm_seconds = 0
+        self.initial_playtime_mins = int(playtime_minutes) # Steam baseline when first checked
+        self.boost_seconds_served = 0.0                    # Actual seconds boosted on this computer's clock
+        self.farm_seconds = 0.0                            # Actual seconds spent in farming
         self.status = "В очереди"
         self.last_drop_time = None
 
     @property
     def total_playtime_minutes(self):
-        return self.initial_playtime_mins + int((self.boost_seconds + self.farm_seconds) / 60)
+        return self.initial_playtime_mins + int((self.boost_seconds_served + self.farm_seconds) / 60)
 
     @property
     def total_playtime_hours(self):
@@ -220,18 +221,22 @@ class GameItem:
             return f"{h} ч."
         return f"{h} ч. {rem_m:02d} мин."
 
+    def remaining_boost_seconds(self, threshold_hours=2.0):
+        target_sec = int(round(threshold_hours * 3600))
+        served_sec = int(self.initial_playtime_mins * 60 + self.boost_seconds_served)
+        return max(0, target_sec - served_sec)
+
     def remaining_boost_minutes(self, threshold_hours=2.0):
-        target_mins = int(round(threshold_hours * 60))
-        return max(0, target_mins - self.total_playtime_minutes)
+        import math
+        return int(math.ceil(self.remaining_boost_seconds(threshold_hours) / 60.0))
 
     def remaining_boost_str(self, threshold_hours=2.0):
-        rem_sec = self.remaining_boost_minutes(threshold_hours) * 60
-        return format_duration(rem_sec)
+        return format_duration(self.remaining_boost_seconds(threshold_hours))
 
     def needs_boost(self, threshold_hours=2.0):
         if self.current_drops <= 0 or self.status in ("✅ Завершено", "Завершено", "⏭ Пропущено", "Пропущено"):
             return False
-        return self.remaining_boost_minutes(threshold_hours) > 0
+        return self.remaining_boost_seconds(threshold_hours) > 0
 
 class FarmingEngine:
     def __init__(self, steam_client):
@@ -323,6 +328,39 @@ class FarmingEngine:
         except Exception:
             pass
 
+    def _load_boost_state(self):
+        """Loads saved boost progress from disk so computer-clock time is preserved across restarts."""
+        if os.path.isfile(BOOST_STATE_PATH):
+            try:
+                with open(BOOST_STATE_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _save_boost_state(self):
+        """Saves current boost progress to disk so computer-clock time is preserved across restarts."""
+        try:
+            data = self._load_boost_state()
+            now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for g in self.games:
+                key = str(g.appid)
+                target_sec = max(0, int(round(self.boost_threshold_hours * 3600)) - (g.initial_playtime_mins * 60))
+                rem_sec = g.remaining_boost_seconds(self.boost_threshold_hours)
+                data[key] = {
+                    "title": g.title,
+                    "steam_baseline_mins": g.initial_playtime_mins,
+                    "target_boost_seconds": target_sec,
+                    "boost_seconds_served": round(g.boost_seconds_served, 1),
+                    "remaining_boost_seconds": rem_sec,
+                    "completed": (rem_sec <= 0),
+                    "last_updated": now_iso
+                }
+            with open(BOOST_STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
     def log(self, msg, level="INFO"):
         now_str = datetime.now().strftime("%H:%M:%S")
         formatted = f"[{now_str}] {msg}"
@@ -330,19 +368,53 @@ class FarmingEngine:
             self.on_log(formatted, level)
 
     def load_games(self):
-        """Loads badges with card drops from Steam client and fetches exact playtime."""
+        """Loads badges with card drops from Steam client, synchronizes baseline and local PC boost progress."""
         self.log("Загрузка списка значков и точного времени игр из Steam...", "INFO")
         try:
             items = self.steam_client.get_badges_with_drops()
-            self.games = [
-                GameItem(
-                    g['appid'],
-                    g['title'],
-                    g['drops_left'],
-                    g.get('playtime_minutes', 0)
-                ) for g in items
-            ]
+            saved_state = self._load_boost_state()
+
+            loaded_games = []
+            for g in items:
+                appid = g['appid']
+                title = g['title']
+                drops_left = g['drops_left']
+                steam_mins = g.get('playtime_minutes', 0)
+
+                key = str(appid)
+                saved = saved_state.get(key, {})
+                saved_baseline = saved.get("steam_baseline_mins")
+                saved_served = float(saved.get("boost_seconds_served", 0.0))
+                saved_comp = bool(saved.get("completed", False))
+
+                # Determine effective baseline and served boost time
+                if saved_baseline is not None:
+                    # If Steam's server playtime has progressed beyond what we tracked before:
+                    if steam_mins > saved_baseline + int(saved_served / 60):
+                        effective_baseline = steam_mins
+                        effective_served = 0.0
+                    else:
+                        effective_baseline = saved_baseline
+                        effective_served = saved_served
+                else:
+                    effective_baseline = steam_mins
+                    effective_served = 0.0
+
+                item = GameItem(appid, title, drops_left, effective_baseline)
+                item.boost_seconds_served = effective_served
+
+                # If previously completed or threshold reached on PC clock:
+                if saved_comp or item.remaining_boost_seconds(self.boost_threshold_hours) <= 0:
+                    needed_total = max(0, int(round(self.boost_threshold_hours * 3600)) - effective_baseline * 60)
+                    item.boost_seconds_served = max(effective_served, float(needed_total))
+                    item.status = "Готов к фарму"
+
+                loaded_games.append(item)
+
+            self.games = loaded_games
             self.initial_total_drops = sum(g.current_drops for g in self.games)
+            self._save_boost_state()
+
             self.log(f"Загружено игр с карточками: {len(self.games)}. Всего карточек: {self.initial_total_drops}", "SUCCESS")
             
             need_boost = [g for g in self.games if g.needs_boost(self.boost_threshold_hours)]
@@ -350,7 +422,8 @@ class FarmingEngine:
                 self.log(f"ℹ Игр, требующих разгона до 2ч: {len(need_boost)}.", "INFO")
                 for g in need_boost:
                     rem_str = g.remaining_boost_str(self.boost_threshold_hours)
-                    self.log(f"   • {g.title}: наиграно {g.total_playtime_str} -> нужно еще {rem_str}", "DEBUG")
+                    served_str = format_duration(g.boost_seconds_served)
+                    self.log(f"   • {g.title}: База Steam={g.initial_playtime_mins} мин. + Разогнано на ПК={served_str} -> осталось на таймере ПК: {rem_str}", "INFO")
             else:
                 self.log(f"ℹ Все игры имеют более {self.boost_threshold_hours:.1f} ч. наигранности. Разгон не требуется.", "INFO")
 
@@ -378,7 +451,7 @@ class FarmingEngine:
         if self.boost_enabled and games_needing_boost:
             boost_sec_needed = max(
                 0,
-                max(g.remaining_boost_minutes(self.boost_threshold_hours) * 60 for g in games_needing_boost)
+                max(g.remaining_boost_seconds(self.boost_threshold_hours) for g in games_needing_boost)
             )
 
         # Games ready to farm immediately (playtime >= 2h)
@@ -481,6 +554,7 @@ class FarmingEngine:
             return
         self.is_paused = True
         self._pause_all_processes()
+        self._save_boost_state()
         self.log("⏸ Фарм поставлен на паузу.", "WARNING")
         if self.on_phase_changed:
             self.on_phase_changed("PAUSED")
@@ -491,6 +565,7 @@ class FarmingEngine:
         self.is_running = False
         self.is_paused = False
         self._stop_event.set()
+        self._save_boost_state()
         self._stop_all_processes()
         self.current_phase = "IDLE"
         self.current_cycle_remaining = 0
@@ -517,6 +592,10 @@ class FarmingEngine:
             for g in self.games:
                 if g.status.startswith("⚡"):
                     g.status = "Готов к фарму"
+                    # Mark served time so it stays ready in saved state
+                    needed_total = max(0, int(round(self.boost_threshold_hours * 3600)) - g.initial_playtime_mins * 60)
+                    g.boost_seconds_served = max(g.boost_seconds_served, float(needed_total))
+        self._save_boost_state()
         self.log("⚡ Разгон до 2 часов пропущен пользователем. Все игры готовы к прямому фарму!", "WARNING")
         if self.on_stats_updated:
             self.on_stats_updated()
@@ -596,10 +675,13 @@ class FarmingEngine:
         cleanup_all_sam_processes()
 
     def _boost_worker(self, boost_games):
-        """Runs parallel boost for games with < 2 hours of playtime in the background."""
+        """
+        Runs parallel boost for games with < 2 hours of playtime in the background.
+        Tracks exact computer-clock elapsed seconds and verifies completion against PC time.
+        """
         self.log("=" * 60, "INFO")
         self.log(f"⚡ [ПАРАЛЛЕЛЬНЫЙ РАЗГОН] Запущен фоновый буст для {len(boost_games)} игр до 2 часов.", "INFO")
-        self.log("💡 Игры разгоняются одновременно в фоне, пока идет поочередный фарм готовых игр!", "INFO")
+        self.log("💡 Игры разгоняются одновременно в фоне по часам ПК, пока идет поочередный фарм готовых игр!", "INFO")
         self.log("=" * 60, "INFO")
 
         # Start SAM for each game needing boost
@@ -614,10 +696,15 @@ class FarmingEngine:
                     self.boost_procs[g.appid] = p
             time.sleep(0.2)
 
+        self._save_boost_state()
         if self.on_stats_updated:
             self.on_stats_updated()
 
-        last_ui_update = time.time()
+        now = time.time()
+        last_tick = now
+        last_state_save = now
+        last_ui_update = now
+
         while self.is_running and not self._stop_event.is_set():
             if self._skip_boost_event.is_set():
                 self.log("⚡ Фоновый разгон остановлен: игры переведены на прямой фарм.", "WARNING")
@@ -629,25 +716,35 @@ class FarmingEngine:
                     for g in boost_games:
                         if g.status.startswith("⚡"):
                             g.status = "Готов к фарму"
+                            needed_total = max(0, int(round(self.boost_threshold_hours * 3600)) - g.initial_playtime_mins * 60)
+                            g.boost_seconds_served = max(g.boost_seconds_served, float(needed_total))
+                self._save_boost_state()
                 if self.on_stats_updated:
                     self.on_stats_updated()
                 break
 
             if self.is_paused:
-                time.sleep(1)
+                last_tick = time.time()
+                time.sleep(0.5)
                 continue
 
-            time.sleep(1)
+            time.sleep(1.0)
+            now = time.time()
+            elapsed_dt = max(0.0, now - last_tick)
+            last_tick = now
 
             still_boosting = 0
             with self._proc_lock:
                 for g in boost_games:
                     if g.appid in self.boost_procs:
-                        if self.boost_procs[g.appid] is not None:
-                            g.boost_seconds += 1
-                        rem_mins = g.remaining_boost_minutes(self.boost_threshold_hours)
-                        if rem_mins == 0:
-                            self.log(f"✅ Игра '{g.title}' достигла 2 часов ({g.total_playtime_str})! Разгон завершен.", "SUCCESS")
+                        proc = self.boost_procs[g.appid]
+                        if proc is not None:
+                            g.boost_seconds_served += elapsed_dt
+
+                        rem_sec = g.remaining_boost_seconds(self.boost_threshold_hours)
+                        if rem_sec <= 0:
+                            # Reached exact required boost duration on computer clock
+                            self.log(f"✅ Игра '{g.title}' достигла 2.0 часов на часах ПК ({g.total_playtime_str})! Разгон завершен.", "SUCCESS")
                             if self.boost_procs[g.appid]:
                                 self._stop_process(self.boost_procs[g.appid])
                             del self.boost_procs[g.appid]
@@ -655,17 +752,22 @@ class FarmingEngine:
                             if self.on_stats_updated:
                                 self.on_stats_updated()
                         else:
-                            rem_str = format_duration(rem_mins * 60)
+                            rem_str = format_duration(rem_sec)
                             g.status = f"⚡ Разгон ({rem_str})"
                             still_boosting += 1
 
-            if time.time() - last_ui_update >= 3:
-                last_ui_update = time.time()
+            if now - last_state_save >= 10.0:
+                last_state_save = now
+                self._save_boost_state()
+
+            if now - last_ui_update >= 2.0:
+                last_ui_update = now
                 if self.on_stats_updated:
                     self.on_stats_updated()
 
             if still_boosting == 0:
-                self.log("🎉 [ФОНОВЫЙ РАЗГОН ЗАВЕРШЕН] Все игры успешно разогнаны до 2 часов!", "SUCCESS")
+                self._save_boost_state()
+                self.log("🎉 [ФОНОВЫЙ РАЗГОН ЗАВЕРШЕН] Все игры успешно разогнаны до 2 часов на часах компьютера!", "SUCCESS")
                 if self.on_stats_updated:
                     self.on_stats_updated()
                 break
@@ -724,27 +826,39 @@ class FarmingEngine:
 
                 time.sleep(3)  # Allow Steam to process game close
 
-                # 2. Check #1
+                # 2. Check #1 (Dual Verification: gamecards + badges page)
                 new_drops = self.steam_client.check_game_drops(game.appid)
+                badge_drops = self.steam_client.check_badges_page_drops(game.appid)
+
+                # If either check indicates 0, the game has 100% completed card drops!
+                if new_drops == 0 or badge_drops == 0:
+                    verified_drops = 0
+                elif new_drops is not None and badge_drops is not None:
+                    verified_drops = min(new_drops, badge_drops)
+                elif new_drops is not None:
+                    verified_drops = new_drops
+                else:
+                    verified_drops = badge_drops
+
                 card_dropped = False
 
-                if new_drops is not None and new_drops < game.current_drops:
+                if verified_drops is not None and verified_drops < game.current_drops:
                     card_dropped = True
-                    dropped = game.current_drops - new_drops
+                    dropped = game.current_drops - verified_drops
                     game.session_dropped += dropped
                     self.total_session_dropped += dropped
-                    game.current_drops = new_drops
+                    game.current_drops = verified_drops
                     game.last_drop_time = datetime.now()
 
-                    self.log(f"✨ ПОЛУЧЕНА КАРТОЧКА (+{dropped})! Игра: \"{game.title}\". Осталось: {new_drops}", "SUCCESS")
+                    self.log(f"✨ ПОЛУЧЕНА КАРТОЧКА (+{dropped})! Игра: \"{game.title}\". Осталось: {verified_drops}", "SUCCESS")
                     if self.on_card_dropped:
                         self.on_card_dropped(game, dropped)
                     if self.on_stats_updated:
                         self.on_stats_updated()
 
-                    if new_drops == 0:
+                    if verified_drops == 0:
                         game.status = "✅ Завершено"
-                        self.log(f"🏆 Все доступные карточки для \"{game.title}\" получены!", "SUCCESS")
+                        self.log(f"🏆 Все доступные карточки для \"{game.title}\" получены! (Подтверждено проверкой значков Steam)", "SUCCESS")
                         time.sleep(2)
                         break
                     else:
@@ -752,7 +866,15 @@ class FarmingEngine:
                         self.current_proc = self._start_process(game.appid)
                         game.status = "▶ Фармится"
                         cycle_start_time = time.time()
-                        self.log(f"🎮 Перезапуск \"{game.title}\" (осталось получить: {new_drops} карт)...", "INFO")
+                        self.log(f"🎮 Перезапуск \"{game.title}\" (осталось получить: {verified_drops} карт)...", "INFO")
+                elif verified_drops == 0:
+                    game.current_drops = 0
+                    game.status = "✅ Завершено"
+                    self.log(f"🏆 Все доступные карточки для \"{game.title}\" получены! (Подтверждено проверкой значков Steam)", "SUCCESS")
+                    if self.on_stats_updated:
+                        self.on_stats_updated()
+                    time.sleep(2)
+                    break
                 else:
                     # 20-second control check wait
                     game.status = f"⏳ Контроль ({self.control_check_delay_sec}с)..."
@@ -768,25 +890,36 @@ class FarmingEngine:
                     if self._stop_event.is_set() or not self.is_running or self._skip_event.is_set():
                         break
 
-                    # 3. Check #2 (Control Check)
+                    # 3. Check #2 (Control Check with Dual Verification)
                     new_drops2 = self.steam_client.check_game_drops(game.appid)
-                    if new_drops2 is not None and new_drops2 < game.current_drops:
+                    badge_drops2 = self.steam_client.check_badges_page_drops(game.appid)
+
+                    if new_drops2 == 0 or badge_drops2 == 0:
+                        verified_drops2 = 0
+                    elif new_drops2 is not None and badge_drops2 is not None:
+                        verified_drops2 = min(new_drops2, badge_drops2)
+                    elif new_drops2 is not None:
+                        verified_drops2 = new_drops2
+                    else:
+                        verified_drops2 = badge_drops2
+
+                    if verified_drops2 is not None and verified_drops2 < game.current_drops:
                         card_dropped = True
-                        dropped = game.current_drops - new_drops2
+                        dropped = game.current_drops - verified_drops2
                         game.session_dropped += dropped
                         self.total_session_dropped += dropped
-                        game.current_drops = new_drops2
+                        game.current_drops = verified_drops2
                         game.last_drop_time = datetime.now()
 
-                        self.log(f"✨ ПОЛУЧЕНА КАРТОЧКА НА КОНТРОЛЬНОЙ ПРОВЕРКЕ (+{dropped})! Игра: \"{game.title}\". Осталось: {new_drops2}", "SUCCESS")
+                        self.log(f"✨ ПОЛУЧЕНА КАРТОЧКА НА КОНТРОЛЬНОЙ ПРОВЕРКЕ (+{dropped})! Игра: \"{game.title}\". Осталось: {verified_drops2}", "SUCCESS")
                         if self.on_card_dropped:
                             self.on_card_dropped(game, dropped)
                         if self.on_stats_updated:
                             self.on_stats_updated()
 
-                        if new_drops2 == 0:
+                        if verified_drops2 == 0:
                             game.status = "✅ Завершено"
-                            self.log(f"🏆 Все доступные карточки для \"{game.title}\" получены!", "SUCCESS")
+                            self.log(f"🏆 Все доступные карточки для \"{game.title}\" получены! (Подтверждено проверкой значков Steam)", "SUCCESS")
                             time.sleep(2)
                             break
                         else:
@@ -794,7 +927,15 @@ class FarmingEngine:
                             self.current_proc = self._start_process(game.appid)
                             game.status = "▶ Фармится"
                             cycle_start_time = time.time()
-                            self.log(f"🎮 Перезапуск \"{game.title}\" (осталось получить: {new_drops2} карт)...", "INFO")
+                            self.log(f"🎮 Перезапуск \"{game.title}\" (осталось получить: {verified_drops2} карт)...", "INFO")
+                    elif verified_drops2 == 0:
+                        game.current_drops = 0
+                        game.status = "✅ Завершено"
+                        self.log(f"🏆 Все доступные карточки для \"{game.title}\" получены! (Подтверждено проверкой значков Steam)", "SUCCESS")
+                        if self.on_stats_updated:
+                            self.on_stats_updated()
+                        time.sleep(2)
+                        break
                     else:
                         self.log(f"ℹ Карточка пока не выпала (осталось: {game.current_drops}). Перезапускаем \"{game.title}\" на новый цикл...", "INFO")
                         self.current_proc = self._start_process(game.appid)
@@ -848,18 +989,15 @@ class FarmingEngine:
                             g.current_drops > 0 and g.status not in ("✅ Завершено", "Завершено", "⏭ Пропущено", "Пропущено")
                             for g in self.games
                         )
+                        any_needs_boost = any(g.needs_boost(self.boost_threshold_hours) for g in self.games)
 
-                    if has_pending and still_boosting and not self._skip_boost_event.is_set():
+                    if has_pending and (still_boosting or any_needs_boost) and not self._skip_boost_event.is_set():
                         # Phase 1: Only boost is active (no games ready for farming yet)
                         if self.current_phase != "BOOST":
                             self.current_phase = "BOOST"
                             self.phase_start_time = datetime.now()
                             if self.on_phase_changed:
                                 self.on_phase_changed("BOOST")
-                        time.sleep(1)
-                        continue
-                    elif has_pending and any(g.needs_boost(self.boost_threshold_hours) for g in self.games) and not self._skip_boost_event.is_set():
-                        # Waiting for boost thread to initialize/tick
                         time.sleep(1)
                         continue
                     else:
@@ -882,6 +1020,7 @@ class FarmingEngine:
         except Exception as e:
             self.log(f"Критическая ошибка в цикле фарма: {e}", "ERROR")
         finally:
+            self._save_boost_state()
             self._stop_all_processes()
             self.is_running = False
             self.current_cycle_remaining = 0

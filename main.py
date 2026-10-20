@@ -676,10 +676,15 @@ class SteamFarmerApp:
     def _update_phase_banner(self, phase):
         if phase == "BOOST":
             boost_count = len(self.engine.boost_procs)
+            rem_sec_max = 0
+            for g in self.engine.games:
+                if g.needs_boost(self.engine.boost_threshold_hours):
+                    rem_sec_max = max(rem_sec_max, g.remaining_boost_seconds(self.engine.boost_threshold_hours))
+            rem_str = format_duration(rem_sec_max)
             self.lbl_current_game.configure(
-                text=f"⚡ ФАЗА 1: Одновременный разгон до 2 часов ({boost_count} игр запущено в фоне)"
+                text=f"⚡ ФАЗА 1: Одновременный разгон до 2 часов ({boost_count} игр в фоне) | Осталось: ~{rem_str}"
             )
-            self.lbl_phase_detail.configure(text="Нет готовых игр. Параллельный разгон: как только первая игра достигнет 2ч, начнется фарм!")
+            self.lbl_phase_detail.configure(text="Сверка времени с часами ПК. Как только первая игра достигнет 2ч, начнется фарм!")
             self._update_mascot_reaction("RUNNING")
         elif phase == "FARMING":
             game = self.engine.current_game
@@ -736,6 +741,16 @@ class SteamFarmerApp:
             boost_note = f" • ⚡ В фоне разгон: {boost_count} игр" if boost_count > 0 else ""
             self.lbl_phase_detail.configure(
                 text=f"До закрытия и проверки: {rem_m:02d}:{rem_s:02d}{boost_note}"
+            )
+        elif self.engine.current_phase == "BOOST" and self.engine.is_running:
+            rem_sec_max = 0
+            for g in self.engine.games:
+                if g.needs_boost(self.engine.boost_threshold_hours):
+                    rem_sec_max = max(rem_sec_max, g.remaining_boost_seconds(self.engine.boost_threshold_hours))
+            rem_str = format_duration(rem_sec_max)
+            boost_count = len(self.engine.boost_procs)
+            self.lbl_phase_detail.configure(
+                text=f"Таймер ПК: до завершения разгона ~{rem_str} • Разгоняется: {boost_count} игр"
             )
 
         if total_initial > 0:
